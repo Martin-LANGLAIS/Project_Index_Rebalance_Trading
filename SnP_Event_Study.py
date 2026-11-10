@@ -37,22 +37,55 @@ MIN_EST_OBS = 120          # nb minimal d'observations pour estimer alpha/beta
 # --------------------------------------------------------------------------
 # 1. Données : liste des changements de composition
 # --------------------------------------------------------------------------
+def _clean_ticker(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
+
+
 def fetch_changes(start_year: int) -> pd.DataFrame:
+    """Dates d'ajout au S&P 500 depuis Wikipédia.
+
+    1) Idéal : le tableau historique des changements (ajouts ET retraits).
+    2) Repli : colonne « Date added » des constituants ACTUELS. Biais du survivant
+       fort (les titres ajoutés puis retirés ou rachetés depuis sont absents),
+       acceptable seulement pour faire tourner le pipeline de bout en bout.
+    """
     html = requests.get(
         WIKI_URL,
         headers={"User-Agent": "Mozilla/5.0 (projet de recherche etudiant)"},
         timeout=30,
     ).text
-    tables = pd.read_html(StringIO(html))
-    changes = tables[1].copy()  # 2e tableau de la page = historique des changements
-    if changes.shape[1] != 6:
-        raise ValueError(f"Structure inattendue du tableau Wikipédia : {changes.shape}")
-    changes.columns = ["date", "added_ticker", "added_name",
-                       "removed_ticker", "removed_name", "reason"]
-    changes["date"] = pd.to_datetime(changes["date"], errors="coerce")
-    changes = changes.dropna(subset=["date", "added_ticker"])
-    changes["added_ticker"] = (changes["added_ticker"].astype(str)
-                               .str.strip().str.replace(".", "-", regex=False))
+
+    changes = None
+    try:  # tableau historique, repéré par son id HTML
+        t = pd.read_html(StringIO(html), attrs={"id": "changes"})[0]
+        if t.shape[1] == 6:
+            changes = t.copy()
+    except (ValueError, ImportError):  # table absente (pandas peut lever ImportError en retentant avec html5lib)
+        pass
+    if changes is None:  # sinon : repérage par les en-têtes
+        for t in pd.read_html(StringIO(html)):
+            header = " ".join(str(c) for col in t.columns
+                              for c in (col if isinstance(col, tuple) else (col,))).lower()
+            if "added" in header and "removed" in header and t.shape[1] == 6:
+                changes = t.copy()
+                break
+
+    if changes is not None:
+        changes.columns = ["date", "added_ticker", "added_name",
+                           "removed_ticker", "removed_name", "reason"]
+        changes["date"] = pd.to_datetime(changes["date"], errors="coerce")  # lignes d'en-tête -> NaT
+        changes = changes.dropna(subset=["date", "added_ticker"])
+        changes["added_ticker"] = _clean_ticker(changes["added_ticker"])
+    else:
+        print("ATTENTION : tableau historique des changements introuvable sur la page.\n"
+              "Repli sur la colonne 'Date added' des constituants actuels : "
+              "BIAIS DU SURVIVANT FORT, résultats à ne pas interpréter tels quels.")
+        cons = pd.read_html(StringIO(html), match="Date added")[0]
+        changes = pd.DataFrame({
+            "date": pd.to_datetime(cons["Date added"], errors="coerce"),
+            "added_ticker": _clean_ticker(cons["Symbol"]),
+        }).dropna(subset=["date"])
+
     changes = changes[changes["date"].dt.year >= start_year]
     return changes.sort_values("date").reset_index(drop=True)
 
