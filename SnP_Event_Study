@@ -1,0 +1,190 @@
+"""
+Event study : effet des ajouts à l'indice S&P 500 sur les rendements anormaux.
+
+Étape 1 du projet « anticipation des changements d'indice ».
+Objectif : mesurer les rendements anormaux cumulés (CAR) autour de la date
+d'effet des ajouts, par décennie, pour voir si l'effet a diminué.
+
+Usage :
+    pip install pandas numpy requests lxml yfinance matplotlib
+    python sp500_event_study.py --start 1996 --out results
+
+LIMITES CONNUES (à documenter dans ton README) :
+  1. Wikipédia donne la date d'EFFET, pas la date d'annonce (en général quelques
+     jours avant, après la clôture). La fenêtre [-10, +5] est donc un compromis.
+     Pour des dates d'annonce précises : communiqués S&P, Bloomberg ou CRSP.
+  2. Biais du survivant : yfinance n'a pas les titres radiés depuis (rachats,
+     faillites). Les ajouts disparus sont exclus silencieusement.
+  3. Prix ajustés Yahoo, pas de données point-in-time.
+"""
+from __future__ import annotations
+
+import argparse
+from io import StringIO
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+BENCH = "SPY"              # benchmark de marché pour le modèle de marché
+EST_WIN = (-250, -30)      # fenêtre d'estimation (jours de bourse relatifs)
+EVENT_WIN = (-10, 5)       # fenêtre d'événement
+MIN_EST_OBS = 120          # nb minimal d'observations pour estimer alpha/beta
+
+
+# --------------------------------------------------------------------------
+# 1. Données : liste des changements de composition
+# --------------------------------------------------------------------------
+def fetch_changes(start_year: int) -> pd.DataFrame:
+    html = requests.get(
+        WIKI_URL,
+        headers={"User-Agent": "Mozilla/5.0 (projet de recherche etudiant)"},
+        timeout=30,
+    ).text
+    tables = pd.read_html(StringIO(html))
+    changes = tables[1].copy()  # 2e tableau de la page = historique des changements
+    if changes.shape[1] != 6:
+        raise ValueError(f"Structure inattendue du tableau Wikipédia : {changes.shape}")
+    changes.columns = ["date", "added_ticker", "added_name",
+                       "removed_ticker", "removed_name", "reason"]
+    changes["date"] = pd.to_datetime(changes["date"], errors="coerce")
+    changes = changes.dropna(subset=["date", "added_ticker"])
+    changes["added_ticker"] = (changes["added_ticker"].astype(str)
+                               .str.strip().str.replace(".", "-", regex=False))
+    changes = changes[changes["date"].dt.year >= start_year]
+    return changes.sort_values("date").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# 2. Données : prix (avec cache disque)
+# --------------------------------------------------------------------------
+def download_prices(tickers: list[str], start: str, end: str, cache: Path) -> pd.DataFrame:
+    if cache.exists():
+        return pd.read_pickle(cache)
+    import yfinance as yf  # import local : inutile pour tester les fonctions pures
+
+    frames = []
+    tickers = sorted(set(tickers) | {BENCH})
+    for i in range(0, len(tickers), 100):  # par paquets pour limiter les échecs
+        chunk = tickers[i:i + 100]
+        px = yf.download(chunk, start=start, end=end, auto_adjust=True,
+                         progress=False, threads=True)["Close"]
+        if isinstance(px, pd.Series):
+            px = px.to_frame(chunk[0])
+        frames.append(px)
+    prices = pd.concat(frames, axis=1).dropna(axis=1, how="all")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    prices.to_pickle(cache)
+    return prices
+
+
+# --------------------------------------------------------------------------
+# 3. Event study : modèle de marché + rendements anormaux
+# --------------------------------------------------------------------------
+def abnormal_returns(rets: pd.DataFrame, ticker: str, event_date: pd.Timestamp):
+    """AR sur EVENT_WIN pour un événement, ou None si données insuffisantes.
+
+    Modèle de marché r_i = a + b * r_m + e, estimé sur EST_WIN (relative à la
+    1re séance >= event_date), puis AR_t = r_i,t - (a + b * r_m,t).
+    """
+    if ticker not in rets.columns or BENCH not in rets.columns:
+        return None
+    idx = rets.index
+    pos = idx.searchsorted(event_date)  # 1re séance >= date d'effet
+    lo_e, hi_e = pos + EST_WIN[0], pos + EST_WIN[1]
+    lo_v, hi_v = pos + EVENT_WIN[0], pos + EVENT_WIN[1]
+    if lo_e < 0 or hi_v >= len(idx):
+        return None
+
+    y = rets[ticker].iloc[lo_e:hi_e + 1]
+    x = rets[BENCH].iloc[lo_e:hi_e + 1]
+    ok = y.notna() & x.notna()
+    if ok.sum() < MIN_EST_OBS:
+        return None
+    beta, alpha = np.polyfit(x[ok], y[ok], 1)
+
+    yv = rets[ticker].iloc[lo_v:hi_v + 1]
+    xv = rets[BENCH].iloc[lo_v:hi_v + 1]
+    ar = yv - (alpha + beta * xv)
+    if ar.isna().any():
+        return None
+    ar.index = range(EVENT_WIN[0], EVENT_WIN[1] + 1)
+    return ar
+
+
+def run_event_study(changes: pd.DataFrame, rets: pd.DataFrame) -> pd.DataFrame:
+    rows, ids = [], []
+    for i, ev in changes.iterrows():
+        ar = abnormal_returns(rets, ev["added_ticker"], ev["date"])
+        if ar is not None:
+            rows.append(ar)
+            ids.append(i)
+    return pd.DataFrame(rows, index=ids)
+
+
+def summarize(ar_df: pd.DataFrame, changes: pd.DataFrame) -> pd.DataFrame:
+    windows = {"CAR[-10,-1]": (-10, -1), "CAR[0,+5]": (0, 5), "CAR[-10,+5]": (-10, 5)}
+    decade = changes.loc[ar_df.index, "date"].dt.year // 10 * 10
+    out = []
+    for d, g in ar_df.groupby(decade):
+        row = {"decennie": int(d), "n": len(g)}
+        for name, (a, b) in windows.items():
+            s = g.loc[:, a:b].sum(axis=1)  # CAR par événement
+            row[name] = s.mean()
+            # t-stat en coupe transversale (hypothèse d'indépendance des événements)
+            row[name + " t"] = (s.mean() / (s.std(ddof=1) / np.sqrt(len(s)))
+                                if len(s) > 1 else np.nan)
+        out.append(row)
+    return pd.DataFrame(out).set_index("decennie")
+
+
+def plot_caar(ar_df: pd.DataFrame, changes: pd.DataFrame, path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    decade = changes.loc[ar_df.index, "date"].dt.year // 10 * 10
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for d, g in ar_df.groupby(decade):
+        ax.plot(g.cumsum(axis=1).mean() * 100, label=f"{int(d)}s (n={len(g)})")
+    ax.axvline(0, color="grey", ls="--", lw=0.8)
+    ax.set_xlabel("Jour de bourse relatif à la date d'effet")
+    ax.set_ylabel("CAAR depuis J-10 (%)")
+    ax.set_title("Rendement anormal cumulé moyen autour d'un ajout au S&P 500")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+
+
+# --------------------------------------------------------------------------
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--start", type=int, default=1996)
+    p.add_argument("--out", type=Path, default=Path("results"))
+    args = p.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    changes = fetch_changes(args.start)
+    print(f"{len(changes)} ajouts depuis {args.start}")
+
+    prices = download_prices(
+        changes["added_ticker"].tolist(),
+        start=f"{args.start - 2}-01-01",
+        end=pd.Timestamp.today().strftime("%Y-%m-%d"),
+        cache=args.out / "prices.pkl",
+    )
+    rets = prices.pct_change(fill_method=None)
+
+    ar_df = run_event_study(changes, rets)
+    print(f"{len(ar_df)} événements exploitables sur {len(changes)} "
+          f"(le reste : titres introuvables / historique insuffisant)")
+
+    summary = summarize(ar_df, changes)
+    print(summary.round(4).to_string())
+    summary.to_csv(args.out / "summary_by_decade.csv")
+    ar_df.to_csv(args.out / "abnormal_returns.csv")
+    plot_caar(ar_df, changes, args.out / "caar_by_decade.png")
+
+
+if __name__ == "__main__":
+    main()
